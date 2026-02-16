@@ -82,13 +82,34 @@ Arduino Uno (SPI)
 HD44780 LCD Display
 ```
 
-### Step-by-Step Process
+### Step-by-Step Process for Each 4-Bit Nibble
 
-1. **Preparation**: The Arduino prepares a byte with control signals (RS for Register Select, Enable pulse)
-2. **Serial Transmission**: Data is sent via SPI one bit at a time
-3. **Shift Register**: The 74HC595 captures 8 bits from the SPI line
-4. **Latch Signal**: A pulse on the SS (Slave Select) pin latches the data
-5. **LCD Response**: The LCD interprets the signals and performs the requested action
+1. **Setup Phase (Enable LOW)**
+   - Prepare 8-bit packet: RS (bit 0), Enable=0 (bit 1), Data (bits 4-7)
+   - Send via SPI to 74HC595 shift register
+   - Latch data with STCP pin pulse (SS low→high)
+   - LCD sees data but doesn't capture it yet (Enable is LOW)
+
+2. **Enable Pulse (Enable HIGH)**
+   - Set Enable bit (Q1) high while keeping data stable
+   - Latch this new state to shift register
+   - LED begins reading data lines
+   - Maintain high for minimum 2µs (ENABLE_PULSE_US)
+
+3. **Falling Edge Trigger (Enable LOW)**
+   - Return Enable to low while data lines remain stable
+   - **LCD captures data on this falling edge** (critical timing point)
+   - Latch final state
+
+4. **Inter-Nibble Pause (100µs)**
+   - Wait 100µs (NIBBLE_DELAY_US) before sending second nibble
+   - **This critical delay prevents character truncation**
+   - Allows LCD time to process first 4-bit chunk
+
+5. **Full Byte Completion**
+   - Send high nibble (bits 7-4)
+   - Send low nibble (bits 3-0 shifted to bits 7-4)
+   - Wait 50µs (CHAR_DELAY_US) before next character
 
 ### Communication Protocol
 
@@ -145,17 +166,22 @@ SPI-Hardware-Prototyping/
 
 ### Main Functions
 
-#### **`lcd_send_nibble(byte nibble, byte rs)`**
-Sends a 4-bit nibble to the LCD with proper SPI signaling.
-- Prepares the data packet with RS and Enable bits
-- Toggles enable signal to latch data into LCD
-- Handles 3-step handshake with LCD
+#### **`sendNibble(byte nibble, bool rs)`**
+Sends a 4-bit nibble to the LCD with precise 3-step SPI handshaking.
+- **Input**: `nibble` (data in bits 4-7), `rs` (0=command, 1=data)
+- **Bit Mapping**: Q0=RS, Q1=Enable, Q4-Q7=LCD Data (D4-D7)
+- **Step 1**: Send data with Enable=0 (setup)
+- **Step 2**: Pulse Enable=1 (LCD begins reading)
+- **Step 3**: Return Enable=0 (LCD captures data on falling edge)
+- **Critical**: Waits 100µs after falling edge for LCD processing
 
-#### **`lcd_send_byte(byte value, byte rs)`**
-Sends a full 8-bit byte by sending two nibbles (high then low).
-- Splits byte into high and low nibbles
-- Calls `lcd_send_nibble()` twice
-- Applies appropriate timing delays
+#### **`sendByte(byte value, bool rs)`**
+Sends a full 8-bit byte as two 4-bit nibbles (HD44780 4-bit mode).
+- Extracts high nibble: `value & 0xF0` → bits 7-4 go to D7-D4
+- Extracts low nibble: `(value << 4) & 0xF0` → bits 3-0 shifted to D7-D4
+- Calls `sendNibble()` twice with 10µs gap between nibbles
+- Applies 50µs delay after second nibble before next character
+- **No longer uses millisecond delays** for individual bytes (prevents slowdown)
 
 #### **`lcd_command(byte cmd)`**
 Sends a command to the LCD (RS=0).
@@ -172,23 +198,31 @@ Positions the cursor at specified row and column.
 - Handles multiple rows with correct DDRAM addressing
 - Row offsets: [0x00, 0x40, 0x14, 0x54]
 
-#### **`lcd_init()`**
-Initializes the LCD display.
-- Power-up delay for stability
-- 3-step reset sequence for 4-bit mode
-- Configures display settings (2-line, 5x8 dots)
-- Clears display and sets entry mode
+#### **`lcdInit()`**
+Initializes the LCD display with HD44780 standard reset sequence.
+- **50ms Power-up delay** for voltage stabilization
+- **3-step reset sequence** (sends 0x30, 0x30, 0x30, then 0x20):
+  - Forces the LCD into 4-bit mode even if previously in 8-bit mode
+  - Each step includes appropriate delays (5ms, 5ms, 1ms, 1ms)
+- **Configuration commands**:
+  - `0x28`: Function Set (4-bit mode, 2 lines, 5×8 dot characters)
+  - `0x0C`: Display Control (Display ON, Cursor OFF, Blink OFF)
+  - `0x06`: Entry Mode (Increment cursor, No shift)
+  - `0x01`: Clear Display
 
 ### Timing Constants
 
 ```cpp
-TIME_PULSE_WIDTH = 1 µs    // Enable pulse duration
-TIME_CHAR_EXEC = 50 µs     // Character execution time
-TIME_CMD_EXEC = 50 µs      // Command execution time
-TIME_HOME_EXEC = 2000 µs   // Home command delay
+ENABLE_PULSE_US = 2 µs     // Enable pulse minimum width (falling edge triggers latch)
+NIBBLE_DELAY_US = 100 µs   // Critical inter-nibble delay (prevents character truncation)
+CHAR_DELAY_US = 50 µs      // Delay after full character sent
+CMD_DELAY_MS = 2 ms        // Standard delay after command execution
+CLEAR_DELAY_MS = 3 ms      // Special delay for clear/home commands
 ```
 
-These timings ensure the LCD has enough time to process each instruction.
+**Critical Fix:** The `NIBBLE_DELAY_US` (100µs) between high and low nibbles is essential. Without sufficient delay, the LCD doesn't have time to process the first 4-bit chunk before receiving the second, causing character truncation (e.g., "SPI Inte" instead of "SPI Interface").
+
+These timings ensure the LCD has enough time to capture and process each instruction reliably.
 
 ---
 
@@ -198,7 +232,7 @@ These timings ensure the LCD has enough time to process each instruction.
 - [PlatformIO](https://platformio.org/) installed
 - Arduino Uno board
 - USB cable for uploading
-- All hardware components listed above
+- All hardware components listed above (74HC595, HD44780, etc.)
 
 ### Installation Steps
 
@@ -213,32 +247,46 @@ These timings ensure the LCD has enough time to process each instruction.
    - PlatformIO should detect the `platformio.ini` file
 
 3. **Connect Hardware**
-   - Follow the pin connections table above
+   - Follow the pin connections table in [Hardware Setup](#hardware-setup)
+   - Connect Arduino Pin 10 (SS) to 74HC595 STCP (Latch) pin
+   - Connect Arduino Pin 11 (MOSI) to 74HC595 Data input
+   - Connect Arduino Pin 13 (SCK) to 74HC595 Clock
+   - Connect GND to both shift register and LCD
    - Ensure all power and ground connections are secure
 
 4. **Upload the Code**
    ```bash
    platformio run --target upload
    ```
-   Or use the VS Code PlatformIO button
+   Or use the VS Code PlatformIO upload button
 
-5. **Verify**
-   - You should see "Welcome home" on the first line
-   - "By Frank" should appear on the second line
+5. **Verify Function**
+   - You should see **"SPI Interface"** on the first line (full text, no truncation)
+   - **"By Francis"** should appear on the second line
+   - If text is truncated, increase `NIBBLE_DELAY_US` in code (try 150 or 200)
 
 ### Customizing the Display
 
-Edit the `setup()` function in `main.cpp`:
+Edit the `setup()` function in [src/main.cpp](src/main.cpp):
 
 ```cpp
 void setup() {
-  // ... initialization code ...
+  pinMode(LATCH_PIN, OUTPUT);
+  SPI.begin();
   
-  lcd_print("Your text here");     // Change first line
-  lcd_setCursor(0, 1);               // Move to row 2
-  lcd_print("Second line");          // Change second line
+  lcdInit();
+  
+  lcdPrint("Your custom text");     // First line (16 chars max)
+  lcdSetCursor(0, 1);                // Move to row 1 (second line)
+  lcdPrint("Line 2 text here");      // Second line (16 chars max)
 }
 ```
+
+**Tips:**
+- Maximum 16 characters per line (standard LCD width)
+- Use `lcdSetCursor(column, row)` where column is 0-15 and row is 0-1
+- Call `lcdCommand(0x01)` to clear display
+- For scrolling or animations, use loops in `loop()` function with appropriate delays
 
 ---
 
@@ -274,9 +322,12 @@ void setup() {
 SPISettings SPI_SETTINGS(500000, MSBFIRST, SPI_MODE0);
 ```
 
-- **Frequency**: 500 kHz (fast enough for LCD)
+- **Frequency**: 500 kHz (optimized for 74HC595 shift register stability)
 - **Bit Order**: MSB First (most significant bit first)
 - **Clock Mode**: SPI_MODE0 (clock low at idle, data captured on rising edge)
+- **Transactions**: Properly wrapped with `SPI.beginTransaction()` and `SPI.endTransaction()` for thread-safe operation
+
+**Note:** Original implementation at 1MHz caused timing issues. Reduced to 500kHz provides more stable communication with the shift register and better integration with LCD timing requirements.
 
 ---
 
@@ -307,6 +358,33 @@ This project can be extended in several ways:
 - [ ] Multiple shift registers for more outputs
 - [ ] Add I2C interface instead of SPI
 - [ ] Create PCB design
+
+---
+
+## 🎓 Lessons Learned
+
+### What Worked Well
+✓ Shift register approach reduces wiring complexity significantly (4 wires vs 11)  
+✓ SPI 500kHz speed is stable and reliable for LCD communication  
+✓ 4-bit mode is the right balance between complexity and performance  
+✓ Bare-metal implementation provides excellent learning opportunity  
+✓ SPI transaction management prevents conflicts with other devices  
+
+### Challenges & Solutions
+⚠ **Challenge:** Characters truncating mid-display ("SPI Inte" instead of "SPI Interface")  
+✓ **Solution:** Added 100µs (NIBBLE_DELAY_US) between high and low nibbles. Without this, LCD doesn't finish processing first nibble before second arrives.  
+
+⚠ **Challenge:** Excessive initial timing overhead (2ms per character)  
+✓ **Solution:** Replaced millisecond delays with microsecond precision (50µs per nibble). Display is now 40× faster.  
+
+⚠ **Challenge:** SPI frequency instability at 1MHz  
+✓ **Solution:** Reduced to 500kHz for more stable shift register operation  
+
+⚠ **Challenge:** SPI bus conflicts when sharing with other devices  
+✓ **Solution:** Wrapped all SPI transfers in `SPI.beginTransaction()` / `SPI.endTransaction()` blocks  
+
+⚠ **Challenge:** Inconsistent Enable pulse timing  
+✓ **Solution:** Standardized to 2µs minimum with proper microsecond-level delay control  
 
 ---
 
