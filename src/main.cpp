@@ -1,145 +1,119 @@
+#include <Arduino.h>
 /*
- * DIY SPI LCD Interface (Hardware SPI)
- * * HARDWARE CONNECTIONS (Arduino Uno):
- * - 595 Pin 14 (Data/DS)   -> Arduino Pin 11 (MOSI)
- * - 595 Pin 11 (Clock/SH)  -> Arduino Pin 13 (SCK)
- * - 595 Pin 12 (Latch/ST)  -> Arduino Pin 10 (SS)
- * * 595 OUTPUT MAPPING:
- * - Q0 -> LCD RS
- * - Q1 -> LCD Enable
- * - Q4-Q7 -> LCD D4-D7
+ * ROBUST REAL HARDWARE SPI LCD (74HC595)
+ * Stable version for Arduino + 74HC595 + 16x2 LCD
  */
 
 #include <SPI.h>
 
-// Define the Slave Select (Latch) pin
-const int SLAVE_SELECT_PIN = 10;
+// ---------------- PIN CONFIG ----------------
+const int LATCH_PIN = 10;   // STCP (RCLK)
 
-// SPI settings: 1MHz is reliable on breadboard wiring, MSB First, Mode 0
-const SPISettings SPI_SETTINGS(1000000, MSBFIRST, SPI_MODE0);
+// ---------------- SPI SETTINGS ----------------
+const SPISettings SPI_SETTINGS(500000, MSBFIRST, SPI_MODE0);
 
-// Forward declarations
-void send_nibble_spi(byte nibble, byte rs);
-void lcd_send_data(byte data, byte rs);
-void lcd_command(byte cmd);
-void lcd_print(const char* str);
-void lcd_setCursor(byte col, byte row);
-void lcd_init();
+// ---------------- TIMING (REAL HARDWARE) ----------------
+const int ENABLE_PULSE_US = 2;      // Min Enable pulse width (µs)
+const int NIBBLE_DELAY_US = 100;    // Delay between high & low nibbles (µs)
+const int CHAR_DELAY_US   = 50;     // Delay after full character (µs)
+const int CMD_DELAY_MS    = 2;      // Delay after command (ms)
+const int CLEAR_DELAY_MS  = 3;      // Delay for clear/home commands (ms)
 
-void setup() {
-  // 1. Configure Pins
-  pinMode(SLAVE_SELECT_PIN, OUTPUT);
+// ---------------- LOW LEVEL SEND ----------------
+// Sends 4-bit nibble via SPI to 74HC595 shift register
+// Data layout: Q0=RS, Q1=Enable, Q2-Q3=unused, Q4-Q7=LCD Data (D4-D7)
+void sendNibble(byte nibble, bool rs) {
+  // Extract bits 4-7 (the actual data for D4-D7)
+  byte packet = nibble & 0xF0;
+
+  // Set RS bit (0=command, 1=data)
+  if (rs) packet |= 0x01;
+
+  // Step 1: Set data with EN=0 (setup phase)
+  SPI.beginTransaction(SPI_SETTINGS);
+  digitalWrite(LATCH_PIN, LOW);
+  SPI.transfer(packet);  // Q4-Q7 have data, Q1=0 (EN disabled)
+  digitalWrite(LATCH_PIN, HIGH);
+  SPI.endTransaction();
+  delayMicroseconds(10);
+
+  // Step 2: Pulse EN high (enable the LCD to capture data)
+  SPI.beginTransaction(SPI_SETTINGS);
+  digitalWrite(LATCH_PIN, LOW);
+  SPI.transfer(packet | 0x02);  // Set Q1 (Enable) high
+  digitalWrite(LATCH_PIN, HIGH);
+  SPI.endTransaction();
+  delayMicroseconds(ENABLE_PULSE_US);
+
+  // Step 3: Return EN to low (LCD latches data on this falling edge)
+  SPI.beginTransaction(SPI_SETTINGS);
+  digitalWrite(LATCH_PIN, LOW);
+  SPI.transfer(packet);  // Q1 back to 0 (EN disabled) - DATA CAPTURED HERE
+  digitalWrite(LATCH_PIN, HIGH);
+  SPI.endTransaction();
+  delayMicroseconds(NIBBLE_DELAY_US);
+}
+
+// Sends a full 8-bit byte as two 4-bit nibbles (HD44780 4-bit mode)
+void sendByte(byte value, bool rs) {
+  // High nibble: bits 7-4 stay in positions 7-4
+  byte highNibble = value & 0xF0;
+  // Low nibble: bits 3-0 shifted to positions 7-4
+  byte lowNibble  = (value << 4) & 0xF0;
   
-  // 2. Initialize SPI
+  sendNibble(highNibble, rs);
+  delayMicroseconds(10);
+  sendNibble(lowNibble, rs);
+  delayMicroseconds(CHAR_DELAY_US);
+}
+
+void lcdCommand(byte cmd) {
+  sendByte(cmd, false);
+  if (cmd == 0x01 || cmd == 0x02) {
+    delay(CLEAR_DELAY_MS);
+  }
+}
+
+void lcdWrite(char c) {
+  sendByte(c, true);
+}
+
+// ---------------- HIGH LEVEL ----------------
+void lcdPrint(const char* str) {
+  while (*str) lcdWrite(*str++);
+}
+
+void lcdSetCursor(byte col, byte row) {
+  byte offsets[] = {0x00, 0x40};
+  lcdCommand(0x80 | (col + offsets[row]));
+}
+
+// ---------------- LCD INIT ----------------
+void lcdInit() {
+  delay(50); // Power-up wait
+
+  // Force 4-bit mode
+  sendNibble(0x30, false); delay(5);
+  sendNibble(0x30, false); delay(5);
+  sendNibble(0x30, false); delay(1);
+  sendNibble(0x20, false); delay(1);
+
+  lcdCommand(0x28); // 4-bit, 2-line
+  lcdCommand(0x0C); // Display ON
+  lcdCommand(0x06); // Entry mode
+  lcdCommand(0x01); // Clear
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  pinMode(LATCH_PIN, OUTPUT);
   SPI.begin();
 
-  // 3. Initialize LCD
-  lcd_init();
+  lcdInit();
 
-  // 4. Test Output
-  lcd_print("SPI Interface");
-  lcd_setCursor(0, 1);
-  lcd_print("By Francis");
+  lcdPrint("SPI Interface");
+  lcdSetCursor(0, 1);
+  lcdPrint("By Francis");
 }
 
-void loop() {
-  // Nothing to loop
-}
-
-// --- LOW LEVEL SPI FUNCTIONS ---
-
-void lcd_send_data(byte data, byte rs) {
-  /* * LOGIC:
-   * We need to send 4 bits of data (nibble) + RS bit + Enable Pulse
-   * Mapping: [D7 D6 D5 D4] [X] [X] [E] [RS]
-   */
-   
-  byte highNibble = (data & 0xF0);        // Get top 4 bits
-  byte lowNibble  = ((data << 4) & 0xF0); // Get bottom 4 bits & shift them up
-
-  send_nibble_spi(highNibble, rs); // Send upper nibble
-  send_nibble_spi(lowNibble, rs);  // Send lower nibble
-}
-
-void send_nibble_spi(byte nibble, byte rs) {
-  byte packet = nibble;
-  
-  // Set RS bit (Bit 0) if sending text/data
-  if (rs == 1) packet |= 0x01; 
-
-  // Acquire SPI bus for this nibble transfer
-  SPI.beginTransaction(SPI_SETTINGS);
-
-  // 1. Set data with Enable LOW (data setup before rising edge)
-  packet &= ~0x02;
-  digitalWrite(SLAVE_SELECT_PIN, LOW);
-  SPI.transfer(packet);
-  digitalWrite(SLAVE_SELECT_PIN, HIGH);
-  delayMicroseconds(2);
-  
-  // 2. Pulse Enable HIGH (rising edge, data already stable)
-  packet |= 0x02;
-  digitalWrite(SLAVE_SELECT_PIN, LOW);
-  SPI.transfer(packet);
-  digitalWrite(SLAVE_SELECT_PIN, HIGH);
-  delayMicroseconds(2);
-
-  // 3. Pulse Enable LOW (falling edge triggers the LCD to read)
-  packet &= ~0x02;
-  digitalWrite(SLAVE_SELECT_PIN, LOW);
-  SPI.transfer(packet);
-  digitalWrite(SLAVE_SELECT_PIN, HIGH);
-
-  // Release SPI bus
-  SPI.endTransaction();
-  
-  delayMicroseconds(50); // Wait for LCD to process
-}
-
-// --- STANDARD LCD FUNCTIONS ---
-
-void lcd_command(byte cmd) {
-  lcd_send_data(cmd, 0); // RS = 0 for Command
-  if (cmd == 0x01 || cmd == 0x02) {
-    delay(5);  // Clear/Home need 1.52ms min
-  } else {
-    delayMicroseconds(50); // Extra settle time after commands
-  }
-}
-
-void lcd_print(const char* str) {
-  while (*str) {
-    lcd_send_data(*str++, 1); // RS = 1 for Data
-  }
-}
-
-void lcd_setCursor(byte col, byte row) {
-  byte offsets[] = {0x00, 0x40, 0x14, 0x54};
-  lcd_command(0x80 | (col + offsets[row]));
-}
-
-void lcd_init() {
-  delay(50); // Power up wait
-
-  // Clear 595 outputs to a known state (all LOW, especially Enable)
-  SPI.beginTransaction(SPI_SETTINGS);
-  digitalWrite(SLAVE_SELECT_PIN, LOW);
-  SPI.transfer(0x00);
-  digitalWrite(SLAVE_SELECT_PIN, HIGH);
-  SPI.endTransaction();
-  delay(10); // Let LCD settle with all lines LOW
-
-  // Force reset into 4-bit mode (Standard HD44780 Sequence)
-  send_nibble_spi(0x30, 0); delay(5);
-  send_nibble_spi(0x30, 0); delayMicroseconds(200);
-  send_nibble_spi(0x30, 0); delayMicroseconds(200);
-  
-  send_nibble_spi(0x20, 0); // Set 4-bit mode interface
-  delayMicroseconds(200);
-  
-  // Configure Options
-  lcd_command(0x28); // Function: 4-bit, 2 Line, 5x8 Dots
-  lcd_command(0x0C); // Display On, Cursor Off
-  lcd_command(0x06); // Entry Mode: Auto Increment
-  lcd_command(0x01); // Clear Display
-}
+void loop() {}
