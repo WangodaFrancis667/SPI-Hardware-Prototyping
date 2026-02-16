@@ -136,6 +136,7 @@ The project uses **4-bit mode**, meaning:
 ## 🎨 Visual Guide
 
 ![Hardware Setup](public/images/visual.png)
+![Hardware Setup](public/images/physical.jpg)
 
 This shows the physical layout and connections of the complete hardware setup.
 
